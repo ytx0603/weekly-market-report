@@ -1,0 +1,1012 @@
+"""
+======================================================================
+每周趋势雷达 — 资本 * 代码 * 巨头的交叉信号
+======================================================================
+自动周报生成器。每周日 GitHub Actions 自动触发:
+  -> 拉取美股板块、GitHub热榜、财经新闻、科技公司动态
+  -> 喂给 DeepSeek LLM 交叉分析
+  -> 生成 PDF + HTML 邮件，发到指定邮箱
+
+核心哲学:
+  股票是资本的投票机 -- 资本比媒体快半步
+  GitHub热度是开发者的投票机 -- 代码不会说谎
+  当多个独立信号源指向同一方向，这个方向值得高度关注。
+
+这不是投资建议。这是趋势雷达。
+======================================================================
+"""
+
+import os
+import sys
+import re
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+# ============================================================
+# 环境配置 (密钥一律从环境变量读取，绝无硬编码)
+# ============================================================
+
+# 本地测试: 加载 .env 文件 (此文件不会上传 GitHub)
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+except ImportError:
+    pass  # GitHub Actions 不需要 python-dotenv
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEEPSEEK_MODEL = "deepseek-chat"
+
+QQ_SMTP_SERVER = "smtp.qq.com"
+QQ_SMTP_PORT = 465
+QQ_EMAIL = os.environ.get("QQ_EMAIL", "")
+QQ_SMTP_CODE = os.environ.get("QQ_SMTP_CODE", "")
+RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", QQ_EMAIL)
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", os.environ.get("GH_TOKEN", ""))
+
+PROJECT_DIR = Path(__file__).parent
+OUTPUT_DIR = PROJECT_DIR / "output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(OUTPUT_DIR / "weekly_report.log", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+NOW = datetime.now()
+ONE_WEEK_AGO = NOW - timedelta(days=7)
+WEEK_STR = f"{NOW.year}年第{NOW.isocalendar()[1]}周"
+
+
+# ============================================================
+# 第1步: 拉取美股板块数据 (yfinance)
+# ============================================================
+
+SECTOR_ETFS = {
+    "科技": "XLK",
+    "通信服务": "XLC",
+    "金融": "XLF",
+    "能源": "XLE",
+    "医疗健康": "XLV",
+    "可选消费": "XLY",
+    "必选消费": "XLP",
+    "工业": "XLI",
+    "材料": "XLB",
+    "房地产": "XLRE",
+    "公用事业": "XLU",
+    "半导体": "SMH",
+    "生物科技": "XBI",
+    "AI与机器人": "BOTZ",
+}
+
+
+def fetch_sector_data():
+    """拉取美股板块ETF本周涨跌幅"""
+    logger.info("[1/4] 拉取美股板块数据...")
+    import yfinance as yf
+
+    results = []
+    for name, ticker in SECTOR_ETFS.items():
+        try:
+            etf = yf.Ticker(ticker)
+            hist = etf.history(start=ONE_WEEK_AGO, end=NOW)
+            if len(hist) < 2:
+                results.append({
+                    "板块": name, "代码": ticker, "周涨跌幅": "数据不足"
+                })
+                continue
+            open_price = float(hist["Open"].iloc[0])
+            close_price = float(hist["Close"].iloc[-1])
+            change_pct = ((close_price - open_price) / open_price) * 100
+            results.append({
+                "板块": name,
+                "代码": ticker,
+                "周涨跌幅": f"{change_pct:+.2f}%",
+                "周一开盘": f"${open_price:.2f}",
+                "最新收盘": f"${close_price:.2f}",
+            })
+            logger.info(f"  {name} ({ticker}): {change_pct:+.2f}%")
+        except Exception as e:
+            logger.warning(f"  {name} ({ticker}) 失败: {e}")
+            results.append({
+                "板块": name, "代码": ticker, "周涨跌幅": "获取失败"
+            })
+
+    # 按涨跌幅排序
+    def _sort_key(item):
+        val = str(item.get("周涨跌幅", ""))
+        try:
+            return float(val.replace("%", "").replace("+", ""))
+        except ValueError:
+            return -999
+    results.sort(key=_sort_key, reverse=True)
+
+    ok_count = sum(
+        1 for r in results
+        if r["周涨跌幅"] not in ("获取失败", "数据不足")
+    )
+    logger.info(f"  板块数据: {len(results)} 个, {ok_count} 个成功")
+    return results
+
+
+# ============================================================
+# 第2步: 拉取 GitHub 数据
+# ============================================================
+
+def fetch_github_trending():
+    """拉取 GitHub 本周最热项目和飙升项目"""
+    logger.info("[2/4] 拉取 GitHub 数据...")
+    import requests
+
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+    date_str = ONE_WEEK_AGO.strftime("%Y-%m-%d")
+
+    # --- 最热项目 ---
+    top_repos = []
+    try:
+        url = (
+            "https://api.github.com/search/repositories"
+            f"?q=created:>={date_str}&sort=stars&order=desc&per_page=10"
+        )
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            for repo in resp.json().get("items", []):
+                desc = repo.get("description") or "无描述"
+                topics = repo.get("topics", [])
+                top_repos.append({
+                    "项目名": repo["full_name"],
+                    "简介": desc[:150],
+                    "语言": repo.get("language") or "未知",
+                    "本周Star": repo["stargazers_count"],
+                    "话题": ", ".join(topics[:5]) or "无",
+                    "URL": repo["html_url"],
+                })
+                logger.info(
+                    f"  {repo['full_name']}: {repo['stargazers_count']} stars"
+                )
+        else:
+            logger.warning(f"  GitHub API 返回 {resp.status_code}")
+    except Exception as e:
+        logger.error(f"  GitHub 热榜失败: {e}")
+
+    # --- 飙升项目 ---
+    rising_repos = []
+    seen_names = {r["项目名"] for r in top_repos}
+    try:
+        url = (
+            "https://api.github.com/search/repositories"
+            f"?q=created:>={date_str}+stars:>30"
+            "&sort=updated&order=desc&per_page=15"
+        )
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            for repo in resp.json().get("items", []):
+                name = repo["full_name"]
+                if name not in seen_names and len(rising_repos) < 10:
+                    desc = repo.get("description") or "无描述"
+                    topics = repo.get("topics", [])
+                    rising_repos.append({
+                        "项目名": name,
+                        "简介": desc[:150],
+                        "语言": repo.get("language") or "未知",
+                        "Star数": repo["stargazers_count"],
+                        "话题": ", ".join(topics[:5]) or "无",
+                        "URL": repo["html_url"],
+                    })
+                    seen_names.add(name)
+            logger.info(f"  飙升项目: {len(rising_repos)} 个")
+    except Exception as e:
+        logger.error(f"  GitHub 飙升失败: {e}")
+
+    return top_repos, rising_repos
+
+
+# ============================================================
+# 第3步: 拉取财经新闻 (RSS)
+# ============================================================
+
+FINANCE_RSS_FEEDS = [
+    ("Reuters", "https://feeds.reuters.com/reuters/businessNews"),
+    ("CNBC", (
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml"
+        "?partnerId=wrss01&id=10001147"
+    )),
+    ("MarketWatch", "https://feeds.marketwatch.com/marketwatch/topstories"),
+    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+]
+
+
+def fetch_finance_news():
+    """拉取财经新闻 RSS"""
+    logger.info("[3/4] 拉取财经新闻...")
+    import feedparser
+
+    all_news = []
+    for source_name, url in FINANCE_RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            if not feed.entries:
+                logger.warning(f"  {source_name}: 无内容")
+                continue
+            count = 0
+            for entry in feed.entries[:8]:
+                title = entry.get("title", "").strip()
+                if not title:
+                    continue
+                link = entry.get("link", "")
+                summary = entry.get(
+                    "summary", entry.get("description", "")
+                )
+                summary = re.sub(r"<[^>]+>", "", summary)[:200]
+                all_news.append({
+                    "来源": source_name,
+                    "标题": title,
+                    "摘要": summary,
+                    "链接": link,
+                })
+                count += 1
+            logger.info(f"  {source_name}: {count} 条")
+        except Exception as e:
+            logger.warning(f"  {source_name} 失败: {e}")
+
+    # 去重
+    seen = set()
+    unique = []
+    for item in all_news:
+        key = item["标题"][:50]
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    logger.info(f"  财经新闻: {len(unique)} 条 (去重后)")
+    return unique[:30]
+
+
+# ============================================================
+# 第4步: 拉取科技公司动态 (Google News RSS)
+# ============================================================
+
+TECH_COMPANIES = [
+    "SpaceX", "Tesla", "OpenAI", "Anthropic",
+    "Apple", "NVIDIA", "Google", "Microsoft", "Meta", "Amazon",
+]
+
+
+def fetch_tech_news():
+    """拉取科技公司近一周动态"""
+    logger.info("[4/4] 拉取科技公司动态...")
+    import feedparser
+
+    all_news = []
+    for company in TECH_COMPANIES:
+        try:
+            url = (
+                "https://news.google.com/rss/search"
+                f"?q={company}+technology+OR+AI+OR+product+OR+acquisition"
+                "&hl=en-US&gl=US&ceid=US:en"
+            )
+            feed = feedparser.parse(url)
+            if not feed.entries:
+                logger.warning(f"  {company}: 无结果")
+                continue
+
+            count = 0
+            for entry in feed.entries[:5]:
+                title = entry.get("title", "").strip()
+                if not title:
+                    continue
+                # Google News title 格式: "标题 - 来源"
+                if " - " in title:
+                    title = title.rsplit(" - ", 1)[0]
+                link = entry.get("link", "")
+                summary = entry.get(
+                    "summary", entry.get("description", "")
+                )
+                summary = re.sub(r"<[^>]+>", "", summary)[:150]
+                all_news.append({
+                    "公司": company,
+                    "标题": title,
+                    "摘要": summary,
+                    "链接": link,
+                })
+                count += 1
+            logger.info(f"  {company}: {count} 条")
+        except Exception as e:
+            logger.warning(f"  {company} 失败: {e}")
+
+    logger.info(f"  科技动态: {len(all_news)} 条")
+    return all_news[:40]
+
+
+# ============================================================
+# 第5步: 构建 Prompt 并调用 DeepSeek
+# ============================================================
+
+def build_prompt(sector_data, top_repos, rising_repos,
+                 finance_news, tech_news):
+    """构建给 DeepSeek 的分析 prompt"""
+    prompt = (
+        "你是一个顶尖的趋势分析师。你的任务不是推荐股票，而是从"
+        "资本流向、开发者社区热度、科技巨头动作和财经新闻中，"
+        "交叉比对找出未来可能爆发的技术/产业/商业热点。\n\n"
+    )
+    prompt += "## 你的核心方法论\n\n"
+    prompt += (
+        "> **资本是先行者** -- 板块资金流向往往比媒体报道快 2-4 周，"
+        "因为机构能拿到我们拿不到的信息。\n"
+        "> **代码不会说谎** -- GitHub 热度反映开发者社区的真实兴趣，"
+        "不受 PR 话术影响。\n"
+        "> **巨头用钱投票** -- 公司的收购、开源、关停、招人方向，"
+        "反映产业巨头的真实判断。\n"
+        "> **交叉验证** -- 当 2 个以上独立信号源指向同一方向时，"
+        "这个方向值得高度关注。\n\n"
+    )
+
+    prompt += "---\n\n## 美股板块本周表现\n\n"
+    for s in sector_data:
+        prompt += (
+            f"- {s['板块']} ({s['代码']}): {s['周涨跌幅']}\n"
+        )
+
+    prompt += "\n## GitHub 本周最热项目\n\n"
+    for i, r in enumerate(top_repos, 1):
+        prompt += (
+            f"{i}. **{r['项目名']}** "
+            f"(stars: {r['本周Star']}) -- {r['简介']}\n"
+            f"   语言: {r['语言']} | 话题: {r['话题']}\n"
+        )
+
+    prompt += "\n## GitHub 飙升项目\n\n"
+    for i, r in enumerate(rising_repos, 1):
+        prompt += (
+            f"{i}. **{r['项目名']}** "
+            f"(stars: {r['Star数']}) -- {r['简介']}\n"
+            f"   语言: {r['语言']} | 话题: {r['话题']}\n"
+        )
+
+    prompt += "\n## 本周财经要闻\n\n"
+    for n in finance_news:
+        prompt += f"- [{n['来源']}] {n['标题']}\n"
+
+    prompt += "\n## 科技公司动态\n\n"
+    for n in tech_news:
+        prompt += f"- [{n['公司']}] {n['标题']}\n"
+
+    prompt += f"""
+
+---
+
+## 你的任务
+
+基于以上全部数据，撰写一份《每周趋势雷达》
+({WEEK_STR}, {NOW.strftime('%Y年%m月%d日')})。
+
+按以下结构输出，用中文，Markdown 格式:
+
+### 一、本周核心判断
+
+最重要的 3-5 个趋势信号。每个包括:
+- **信号名称**
+- **为什么重要** (2-3 句)
+- **证据链** (来自哪几个数据源的哪几条，交叉印证了什么)
+
+### 二、各维度详情
+
+#### 2.1 资本信号: 资金在从哪往哪流
+- 本周涨幅前三和跌幅前三的板块
+- 这些流向暗示什么产业趋势 (联系具体新闻)
+
+#### 2.2 代码信号: 开发者在疯狂造什么
+- GitHub 热榜反映的主题聚类 (按领域归纳，不是罗列项目)
+- 值得关注的单个项目 (2-3个，说明为什么值得关注)
+
+#### 2.3 巨头信号: 科技公司的集体动作
+- 巨头们在共同押注什么方向? 在放弃什么?
+- 值得注意的单个事件 (2-3个，说明为什么重要)
+
+#### 2.4 宏观信号: 政策与市场环境
+
+### 三、未来 2-4 周预判
+- 哪些赛道可能持续受到资本和开发者双重关注
+- 哪些风险信号值得警惕
+- 哪些被忽视的领域可能出现拐点 (如果有的话)
+
+### 四、隐性关联分析 (最有价值的部分)
+
+找出表面上无关、但实际可能指向同一底层变量的信号组合。
+给出 3-4 组关联。
+
+每组格式:
+- **关联主题**
+- **涉及信号**: 来自哪几个维度的哪几条 (具体列出)
+- **底层逻辑**: 为什么这些看似无关的信号会同时出现，
+  它们共同指向什么深层变化
+- **置信度**: 高 / 中 / 低
+
+---
+
+## 写作要求
+
+1. 语言简洁有力，不要废话套话
+2. 每个判断都要有数据支撑，具体引用来自哪个数据源
+3. 敢于下判断，但标注不确定性
+4. 不要推荐任何具体股票
+5. 不要使用"总之""综上所述""值得注意的是"等套话
+6. 输出纯 Markdown，不要用代码块包裹
+7. 隐性关联分析是你最有价值的产出，认真写
+"""
+    return prompt
+
+
+def call_deepseek(prompt: str) -> Optional[str]:
+    """调用 DeepSeek API 生成报告"""
+    logger.info("调用 DeepSeek API...")
+
+    if not DEEPSEEK_API_KEY:
+        logger.error(
+            "DEEPSEEK_API_KEY 未设置! "
+            "请在 GitHub Secrets 或 .env 中配置"
+        )
+        return None
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=DEEPSEEK_API_KEY,
+            base_url=DEEPSEEK_BASE_URL,
+        )
+
+        logger.info(
+            f"  模型: {DEEPSEEK_MODEL}, "
+            f"prompt 约 {len(prompt)} 字符"
+        )
+        response = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个顶尖的趋势分析师，擅长从资本流向、"
+                        "开发者社区、科技巨头动作和财经新闻四个维度"
+                        "交叉比对，找出未来趋势。你的风格: 简洁、"
+                        "有数据支撑、敢于下判断但标注不确定性。"
+                        "你坚信代码不会说谎，资本比媒体快半步。"
+                        "用中文输出。"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=8192,
+        )
+
+        report = response.choices[0].message.content
+        usage = response.usage
+        logger.info(
+            f"  报告完成: {len(report)} 字符, "
+            f"{usage.total_tokens} tokens "
+            f"(in={usage.prompt_tokens}, out={usage.completion_tokens})"
+        )
+        return report
+
+    except Exception as e:
+        logger.error(f"  DeepSeek API 失败: {e}")
+        return None
+
+
+# ============================================================
+# 第6步: 生成 PDF (fpdf2 + 中文字体)
+# ============================================================
+
+def find_cjk_font() -> Optional[str]:
+    """查找系统中可用的中文字体文件"""
+    candidates = [
+        # GitHub Actions (Ubuntu + fonts-noto-cjk)
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        # Windows
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/msyh.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
+        # 项目自带
+        str(PROJECT_DIR / "fonts" / "NotoSansSC-Regular.ttf"),
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            logger.info(f"  中文字体: {path}")
+            return path
+    return None
+
+
+def markdown_to_pdf(md_text: str, cjk_font_path: str) -> Path:
+    """将 Markdown 报告转为 PDF (支持中文)"""
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+
+    font_name = "CJK"
+    try:
+        pdf.add_font(font_name, "", cjk_font_path)
+        try:
+            pdf.add_font(font_name, "B", cjk_font_path)
+        except Exception:
+            pass  # TTC 可能不支持粗体注册
+    except Exception as e:
+        logger.error(f"  字体注册失败: {e}")
+        raise
+
+    # ---- 封面 ----
+    pdf.add_page()
+    pdf.ln(50)
+    pdf.set_font(font_name, "B", 32)
+    pdf.set_text_color(30, 30, 30)
+    pdf.cell(0, 18, "每周趋势雷达", align="C",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(8)
+    pdf.set_font(font_name, "", 14)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 10, "资本 * 代码 * 巨头的交叉信号",
+             align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(15)
+    pdf.set_draw_color(200, 200, 200)
+    y = pdf.get_y()
+    pdf.line(60, y, 150, y)
+    pdf.ln(15)
+    pdf.set_font(font_name, "", 12)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 8, WEEK_STR, align="C",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8,
+             f"生成日期: {NOW.strftime('%Y年%m月%d日')}",
+             align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(30)
+    pdf.set_font(font_name, "", 9)
+    pdf.set_text_color(150, 150, 150)
+    pdf.cell(0, 7, "数据源: Yahoo Finance / GitHub API / RSS",
+             align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "分析引擎: DeepSeek LLM",
+             align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7,
+             "本报告由 AI 自动生成，仅供参考，不构成投资建议",
+             align="C", new_x="LMARGIN", new_y="NEXT")
+
+    # ---- 正文 ----
+    pdf.add_page()
+    pdf.set_text_color(40, 40, 40)
+
+    lines = md_text.split("\n")
+    in_code_block = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 跳过代码块标记
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            pdf.ln(2)
+            continue
+        if in_code_block:
+            pdf.set_font(font_name, "", 8)
+            pdf.set_text_color(80, 80, 80)
+            pdf.multi_cell(0, 4, stripped)
+            continue
+
+        if not stripped:
+            pdf.ln(2)
+            continue
+
+        # 一级标题
+        if (stripped.startswith("# ")
+                and not stripped.startswith("## ")):
+            pdf.ln(4)
+            pdf.set_font(font_name, "B", 16)
+            pdf.set_text_color(30, 30, 30)
+            pdf.multi_cell(0, 9, stripped[2:])
+            pdf.ln(3)
+            continue
+
+        # 二级标题
+        if stripped.startswith("## "):
+            pdf.ln(3)
+            pdf.set_font(font_name, "B", 13)
+            pdf.set_text_color(50, 50, 50)
+            pdf.multi_cell(0, 7, stripped[3:])
+            pdf.ln(1)
+            continue
+
+        # 三级标题
+        if stripped.startswith("### "):
+            pdf.ln(2)
+            pdf.set_font(font_name, "B", 11)
+            pdf.set_text_color(60, 60, 60)
+            pdf.multi_cell(0, 6, stripped[4:])
+            continue
+
+        # 四级标题
+        if stripped.startswith("#### "):
+            pdf.ln(1)
+            pdf.set_font(font_name, "B", 10)
+            pdf.set_text_color(70, 70, 70)
+            pdf.multi_cell(0, 6, stripped[5:])
+            continue
+
+        # 分隔线
+        if stripped == "---":
+            pdf.ln(2)
+            pdf.set_draw_color(200, 200, 200)
+            y_pos = pdf.get_y()
+            pdf.line(pdf.l_margin, y_pos,
+                     pdf.w - pdf.r_margin, y_pos)
+            pdf.ln(2)
+            continue
+
+        # 清除 Markdown 格式标记
+        clean = re.sub(r"\*\*(.+?)\*\*", r"\1", stripped)
+        clean = re.sub(r"\*(.+?)\*", r"\1", clean)
+        clean = re.sub(r"`(.+?)`", r"\1", clean)
+
+        # 列表项
+        if re.match(r"^[-*]\s", clean):
+            pdf.set_font(font_name, "", 9)
+            pdf.set_text_color(40, 40, 40)
+            pdf.cell(4, 5, "-")
+            pdf.multi_cell(0, 5, clean[2:])
+            continue
+
+        # 编号列表
+        if re.match(r"^\d+\.\s", clean):
+            pdf.set_font(font_name, "", 9)
+            pdf.set_text_color(40, 40, 40)
+            pdf.multi_cell(0, 5, clean)
+            continue
+
+        # 普通段落
+        pdf.set_font(font_name, "", 9)
+        pdf.set_text_color(40, 40, 40)
+        pdf.multi_cell(0, 5, clean)
+
+    # 保存
+    filename = f"WeeklyTrendRadar_{NOW.strftime('%Y%m%d')}.pdf"
+    filepath = OUTPUT_DIR / filename
+    pdf.output(str(filepath))
+    logger.info(f"  PDF 已保存: {filepath}")
+    return filepath
+
+
+def generate_pdf(report_md: str) -> Optional[Path]:
+    """生成 PDF，找不到字体则跳过"""
+    logger.info("生成 PDF...")
+    font_path = find_cjk_font()
+    if not font_path:
+        logger.warning("  未找到中文字体，跳过 PDF 生成")
+        return None
+    try:
+        return markdown_to_pdf(report_md, font_path)
+    except Exception as e:
+        logger.error(f"  PDF 生成失败: {e}")
+        return None
+
+
+# ============================================================
+# 第7步: 简易 Markdown -> HTML (邮件正文)
+# ============================================================
+
+def md_to_html(md_text: str) -> str:
+    """将 Markdown 报告转为 HTML 邮件正文"""
+    lines = md_text.strip().split("\n")
+    html_parts = []
+    in_ul = False
+    in_ol = False
+    in_blockquote = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 代码块
+        if stripped.startswith("```"):
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            if in_ol:
+                html_parts.append("</ol>")
+                in_ol = False
+            html_parts.append("<br>")
+            continue
+
+        if not stripped:
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            if in_ol:
+                html_parts.append("</ol>")
+                in_ol = False
+            if in_blockquote:
+                html_parts.append("</blockquote>")
+                in_blockquote = False
+            html_parts.append("<br>")
+            continue
+
+        # 引用块
+        if stripped.startswith("> "):
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            if not in_blockquote:
+                html_parts.append(
+                    '<blockquote style="border-left:3px solid #ccc; '
+                    'margin:8px 0; padding:4px 12px; color:#555">'
+                )
+                in_blockquote = True
+            content = re.sub(
+                r"\*\*(.+?)\*\*", r"<b>\1</b>", stripped[2:]
+            )
+            html_parts.append(f"<p>{content}</p>")
+            continue
+
+        if in_blockquote:
+            html_parts.append("</blockquote>")
+            in_blockquote = False
+
+        # 标题
+        if stripped.startswith("#### "):
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            html_parts.append(
+                f"<h4 style='color:#444'>{stripped[5:]}</h4>"
+            )
+        elif stripped.startswith("### "):
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            html_parts.append(
+                f"<h3 style='color:#333; margin-top:20px'>"
+                f"{stripped[4:]}</h3>"
+            )
+        elif stripped.startswith("## "):
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            html_parts.append(
+                f"<h2 style='color:#222; margin-top:24px; "
+                f"border-bottom:1px solid #ddd; padding-bottom:4px'>"
+                f"{stripped[3:]}</h2>"
+            )
+        elif stripped.startswith("# "):
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            html_parts.append(
+                f"<h1 style='color:#111; margin-top:28px'>"
+                f"{stripped[2:]}</h1>"
+            )
+        elif stripped == "---":
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            html_parts.append(
+                "<hr style='border:none; border-top:1px solid #ddd; "
+                "margin:16px 0'>"
+            )
+        elif re.match(r"^[-*]\s", stripped):
+            if in_ol:
+                html_parts.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                html_parts.append(
+                    '<ul style="padding-left:20px">'
+                )
+                in_ul = True
+            content = re.sub(
+                r"\*\*(.+?)\*\*", r"<b>\1</b>", stripped[2:]
+            )
+            html_parts.append(f"<li>{content}</li>")
+        elif re.match(r"^\d+\.\s", stripped):
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                html_parts.append(
+                    '<ol style="padding-left:20px">'
+                )
+                in_ol = True
+            content = re.sub(
+                r"\*\*(.+?)\*\*", r"<b>\1</b>", stripped
+            )
+            html_parts.append(f"<li>{content}</li>")
+        else:
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            if in_ol:
+                html_parts.append("</ol>")
+                in_ol = False
+            content = re.sub(
+                r"\*\*(.+?)\*\*", r"<b>\1</b>", stripped
+            )
+            content = re.sub(r"\*(.+?)\*", r"<i>\1</i>", content)
+            content = re.sub(
+                r"`(.+?)`", r"<code>\1</code>", content
+            )
+            html_parts.append(f"<p>{content}</p>")
+
+    if in_ul:
+        html_parts.append("</ul>")
+    if in_ol:
+        html_parts.append("</ol>")
+    if in_blockquote:
+        html_parts.append("</blockquote>")
+
+    body = "\n".join(html_parts)
+
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="zh-CN">\n'
+        '<head><meta charset="utf-8"></head>\n'
+        '<body style="font-family:-apple-system,\'Microsoft YaHei\','
+        "'PingFang SC',sans-serif; max-width:720px; margin:0 auto; "
+        "padding:20px; color:#333; line-height:1.8; font-size:14px; "
+        'background:#fff;">\n'
+        '<div style="background:#f8f8f8; padding:20px; '
+        'border-radius:8px; margin-bottom:24px;">\n'
+        '  <h1 style="color:#1a1a1a; margin:0 0 4px 0; '
+        'font-size:22px;">'
+        '每周趋势雷达'
+        '</h1>\n'
+        '  <p style="color:#888; margin:0; font-size:12px;">\n'
+        f'    {WEEK_STR} / 资本*代码*巨头的交叉信号'
+        f' / {NOW.strftime("%Y-%m-%d %H:%M")}\n'
+        '  </p>\n'
+        '</div>\n'
+        f'{body}\n'
+        '<hr style="border:none; border-top:1px solid #eee; '
+        'margin:24px 0">\n'
+        '<p style="color:#aaa; font-size:11px; text-align:center;">\n'
+        '本报告由 DeepSeek LLM 自动分析生成，仅供参考，'
+        '不构成任何投资建议。<br>\n'
+        '数据源: Yahoo Finance / GitHub API / RSS\n'
+        '</p>\n'
+        '</body>\n'
+        '</html>'
+    )
+
+
+# ============================================================
+# 第8步: 发送邮件
+# ============================================================
+
+def send_email(pdf_path: Optional[Path], report_md: str) -> bool:
+    """通过 QQ 邮箱发送报告 (HTML 正文 + PDF 附件)"""
+    logger.info("发送邮件...")
+
+    if not QQ_EMAIL or not QQ_SMTP_CODE:
+        logger.error("QQ_EMAIL 或 QQ_SMTP_CODE 未设置!")
+        return False
+
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+
+    msg = MIMEMultipart("mixed")
+    msg["From"] = QQ_EMAIL
+    msg["To"] = RECIPIENT_EMAIL
+    msg["Subject"] = (
+        f"[每周趋势雷达] {WEEK_STR} ({NOW.strftime('%m/%d')})"
+    )
+
+    # HTML 正文
+    html_body = md_to_html(report_md)
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    # PDF 附件
+    if pdf_path and pdf_path.exists():
+        with open(pdf_path, "rb") as f:
+            attachment = MIMEBase("application", "pdf")
+            attachment.set_payload(f.read())
+            encoders.encode_base64(attachment)
+            attachment.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=("utf-8", "", pdf_path.name),
+            )
+            msg.attach(attachment)
+        logger.info(f"  附件: {pdf_path.name}")
+    else:
+        logger.info("  无 PDF 附件 (仅 HTML 邮件)")
+
+    try:
+        with smtplib.SMTP_SSL(
+            QQ_SMTP_SERVER, QQ_SMTP_PORT
+        ) as server:
+            server.login(QQ_EMAIL, QQ_SMTP_CODE)
+            server.send_message(msg)
+        logger.info(f"  邮件已发送 -> {RECIPIENT_EMAIL}")
+        return True
+    except Exception as e:
+        logger.error(f"  邮件发送失败: {e}")
+        return False
+
+
+# ============================================================
+# 主流程
+# ============================================================
+
+def main():
+    logger.info("=" * 60)
+    logger.info(
+        f"Weekly Trend Radar - Start ({NOW.isoformat()})"
+    )
+    logger.info("=" * 60)
+
+    # ---- 拉取数据 ----
+    sector_data = fetch_sector_data()
+    top_repos, rising_repos = fetch_github_trending()
+    finance_news = fetch_finance_news()
+    tech_news = fetch_tech_news()
+
+    # ---- 检查关键数据 ----
+    sector_ok = any(
+        s.get("周涨跌幅") not in ("获取失败", "数据不足")
+        for s in sector_data
+    )
+    if not sector_ok:
+        logger.error("板块数据全部失败，但仍尝试生成报告")
+
+    if not top_repos and not rising_repos:
+        logger.warning("GitHub 数据为空 (可能被限流)")
+
+    # ---- 调用 DeepSeek ----
+    prompt = build_prompt(
+        sector_data, top_repos, rising_repos,
+        finance_news, tech_news
+    )
+    report_md = call_deepseek(prompt)
+
+    if not report_md:
+        logger.error("DeepSeek 报告生成失败，流程终止")
+        sys.exit(1)
+
+    # ---- 保存 Markdown ----
+    md_path = OUTPUT_DIR / f"report_{NOW.strftime('%Y%m%d')}.md"
+    md_path.write_text(report_md, encoding="utf-8")
+    logger.info(f"Markdown 已保存: {md_path}")
+
+    # ---- 生成 PDF ----
+    pdf_path = generate_pdf(report_md)
+
+    # ---- 发送邮件 ----
+    success = send_email(pdf_path, report_md)
+
+    # ---- 收尾 ----
+    logger.info("=" * 60)
+    if success:
+        logger.info(f"Done! Report sent to {RECIPIENT_EMAIL}")
+    else:
+        logger.warning(
+            f"Report generated but email failed. See: {md_path}"
+        )
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
