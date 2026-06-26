@@ -823,11 +823,286 @@ def build_analysis_section(corr_result, topic_result, sentiment_result):
 
 
 # ============================================================
+# 规则引擎 — 多信号交叉异常检测，直接标红报警
+# ============================================================
+
+# 板块 → GitHub 话题映射（用于资本-代码交叉比对）
+SECTOR_TOPIC_MAP = {
+    "半导体": {"semiconductor", "chip", "gpu", "tpu", "npu", "risc-v",
+               "eda", "fpga", "asic", "silicon", "cuda", "opencl",
+               "verilog", "hdl"},
+    "AI与机器人": {"ai", "artificial-intelligence", "machine-learning",
+                  "deep-learning", "llm", "nlp", "robot", "robotics",
+                  "agent", "rag", "transformer", "diffusion", "rlhf",
+                  "fine-tuning", "langchain", "autogpt", "mcp"},
+    "科技": {"cloud", "saas", "devops", "kubernetes", "docker",
+            "serverless", "api", "microservices", "backend"},
+    "金融": {"fintech", "blockchain", "defi", "crypto", "trading",
+            "quantitative-finance", "web3", "solidity"},
+    "能源": {"energy", "solar", "battery", "renewable", "nuclear",
+            "hydrogen", "photovoltaic"},
+    "医疗健康": {"health", "medical", "healthcare", "ehr", "telemedicine"},
+    "生物科技": {"biotech", "bioinformatics", "protein", "crispr",
+                "rna", "sequencing", "genomics", "drug-discovery"},
+    "通信服务": {"5g", "6g", "telecom", "satellite", "networking",
+                "iot", "edge-computing", "sdn"},
+    "可选消费": {"ecommerce", "gaming", "metaverse", "vr", "ar",
+                "streaming", "social-media"},
+    "工业": {"manufacturing", "industry-4.0", "iot", "automation",
+            "digital-twin", "robotics", "plc"},
+    "材料": {"materials", "battery-materials", "graphene", "nanotech"},
+    "房地产": {"proptech", "smart-home", "construction"},
+    "公用事业": {"energy", "grid", "smart-grid", "water"},
+}
+
+
+def check_capital_code_divergence(sector_data, topic_result):
+    """规则1：资本-代码背离。板块涨但GitHub无声 / GitHub热但板块跌"""
+    if not topic_result or not topic_result.get("top_topics"):
+        return None
+
+    github_topics = {t.lower() for t, _ in topic_result["top_topics"]}
+    all_github_words = set()
+    for topic in github_topics:
+        all_github_words.update(
+            topic.replace("-", " ").replace("_", " ").split()
+        )
+    all_github_words |= github_topics
+
+    ranked = sorted(
+        [s for s in sector_data
+         if s.get("周涨跌幅") not in ("获取失败", "数据不足")],
+        key=lambda x: float(x["周涨跌幅"].replace("%", "").replace("+", "")),
+        reverse=True,
+    )
+    if len(ranked) < 5:
+        return None
+
+    alerts = []
+
+    # 涨幅 Top 3，对应 GitHub 话题完全缺席
+    for sector in ranked[:3]:
+        name = sector["板块"]
+        topics = SECTOR_TOPIC_MAP.get(name, set())
+        if not topics:
+            continue
+        overlap = topics & all_github_words
+        if not overlap:
+            alerts.append({
+                "type": "资本-代码背离",
+                "direction": "资本先行",
+                "sector": name,
+                "change": sector["周涨跌幅"],
+                "evidence": (
+                    f"{name}本周涨{sector['周涨跌幅']}"
+                    f"（板块第{ranked.index(sector) + 1}），"
+                    f"但其关联技术话题（"
+                    f"{', '.join(sorted(topics)[:8])}等）"
+                    f"在 GitHub Top {len(github_topics)} 热门话题中完全缺席"
+                ),
+                "interpretation": (
+                    f"机构可能在提前布局{name}相关标的，"
+                    f"而开发者社区尚未跟上。"
+                    f"若未来 2-4 周 GitHub 上相关话题开始出现，则信号确认。"
+                ),
+            })
+
+    # GitHub 最热话题对应垫底板块
+    hot_topics = {t.lower() for t, _ in topic_result["top_topics"][:5]}
+    for sector in ranked[-3:]:
+        name = sector["板块"]
+        topics = SECTOR_TOPIC_MAP.get(name, set())
+        if not topics:
+            continue
+        overlap = topics & hot_topics
+        if overlap:
+            alerts.append({
+                "type": "资本-代码背离",
+                "direction": "代码先行",
+                "sector": name,
+                "change": sector["周涨跌幅"],
+                "evidence": (
+                    f"GitHub 热门话题包含 {', '.join(sorted(overlap))}"
+                    f"（映射到{name}板块），但{name}本周仅"
+                    f"{sector['周涨跌幅']}（板块倒数）。"
+                    f"开发者在建的东西，资本还没跟进。"
+                ),
+                "interpretation": (
+                    f"可能是一个早期信号：开发者社区在押注"
+                    f"{name}相关技术方向，但市场尚未定价。"
+                    f"需关注该板块后续资金流入。"
+                ),
+            })
+
+    if alerts:
+        logger.info(f"  [规则引擎] 资本-代码背离: {len(alerts)} 条")
+        return alerts
+    return None
+
+
+def check_sentiment_price_divergence(sector_data, sentiment_result):
+    """规则2：情绪-价格背离。新闻乐观但市场跌 / 新闻悲观但市场涨"""
+    if not sentiment_result:
+        return None
+
+    avg_sentiment = sentiment_result["avg_compound"]
+
+    up_count = 0
+    down_count = 0
+    for s in sector_data:
+        val = str(s.get("周涨跌幅", ""))
+        try:
+            pct = float(val.replace("%", "").replace("+", ""))
+            if pct > 0:
+                up_count += 1
+            elif pct < 0:
+                down_count += 1
+        except ValueError:
+            pass
+
+    total = up_count + down_count
+    if total < 5:
+        return None
+
+    up_ratio = up_count / total
+    alerts = []
+
+    if avg_sentiment > 0.3 and up_ratio < 0.35:
+        alerts.append({
+            "type": "情绪-价格背离",
+            "direction": "媒体乐观、市场悲观",
+            "evidence": (
+                f"本周财经新闻平均情感得分 {avg_sentiment:.2f}（偏正面），"
+                f"但 {total} 个板块中仅 {up_count} 个上涨"
+                f"（{up_ratio:.0%}）。"
+                f"媒体叙事与资金实际走向出现明显分歧。"
+            ),
+            "interpretation": (
+                "媒体乐观但资金在撤退——通常意味着聪明的钱已在离场，"
+                "而媒体仍在讲好故事。需结合具体板块跌幅判断风险级别。"
+            ),
+        })
+
+    if avg_sentiment < -0.2 and up_ratio > 0.65:
+        alerts.append({
+            "type": "情绪-价格背离",
+            "direction": "媒体悲观、市场乐观",
+            "evidence": (
+                f"本周财经新闻平均情感得分 {avg_sentiment:.2f}（偏负面），"
+                f"但 {total} 个板块中 {up_count} 个上涨"
+                f"（{up_ratio:.0%}）。"
+                f"媒体在恐慌，但资金在买入。"
+            ),
+            "interpretation": (
+                "这往往是市场见底的信号之一——恐慌叙事笼罩时，"
+                "机构可能在悄悄吸筹。关注涨幅最大的板块。"
+            ),
+        })
+
+    if alerts:
+        logger.info(f"  [规则引擎] 情绪-价格背离: {len(alerts)} 条")
+        return alerts
+    return None
+
+
+def check_topic_concentration(topic_result):
+    """规则3：话题集中度预警。单一话题占比过高可能意味着泡沫"""
+    if not topic_result or not topic_result.get("top_topics"):
+        return None
+
+    topics = topic_result["top_topics"]
+    total_mentions = sum(c for _, c in topics)
+    if total_mentions == 0:
+        return None
+
+    top_topic, top_count = topics[0]
+    concentration = top_count / total_mentions
+
+    if concentration > 0.30:
+        logger.info(
+            f"  [规则引擎] 话题集中度: {top_topic} 占 {concentration:.0%}"
+        )
+        return [{
+            "type": "话题集中度预警",
+            "topic": top_topic,
+            "concentration": f"{concentration:.0%}",
+            "evidence": (
+                f"GitHub 热门话题中「{top_topic}」出现 {top_count} 次，"
+                f"占全部 {total_mentions} 次话题标注的 {concentration:.0%}。"
+                f"前 5 话题: "
+                + "、".join(f"{t}({c})" for t, c in topics[:5])
+            ),
+            "interpretation": (
+                f"极高的话题集中度可能意味着泡沫——"
+                f"当所有人都在谈论同一件事时，这件事已经被充分定价。"
+                f"同时关注话题榜长尾部分是否有被忽视的信号。"
+            ),
+        }]
+    return None
+
+
+def run_rule_engine(sector_data, topic_result, sentiment_result):
+    """规则引擎主入口。顺序执行所有规则，返回格式化的报警 Markdown"""
+    logger.info("[规则引擎] 运行交叉信号异常检测...")
+
+    all_alerts = []
+
+    result = check_capital_code_divergence(sector_data, topic_result)
+    if result:
+        all_alerts.extend(result)
+
+    result = check_sentiment_price_divergence(sector_data, sentiment_result)
+    if result:
+        all_alerts.extend(result)
+
+    result = check_topic_concentration(topic_result)
+    if result:
+        all_alerts.extend(result)
+
+    if not all_alerts:
+        logger.info("  [规则引擎] 无异常信号")
+        return ""
+
+    logger.info(f"  [规则引擎] 共触发 {len(all_alerts)} 条报警")
+
+    lines = []
+    lines.append("## ⚠️ 规则引擎报警（程序自动检测，非 LLM 生成）\n")
+
+    for i, alert in enumerate(all_alerts, 1):
+        lines.append(f"### 🚨 报警 {i}: {alert['type']}")
+
+        if "direction" in alert:
+            lines.append(f"**方向**: {alert['direction']}")
+        if "sector" in alert:
+            lines.append(
+                f"**涉及板块**: {alert['sector']} "
+                f"({alert.get('change', '')})"
+            )
+        if "topic" in alert:
+            lines.append(
+                f"**相关话题**: {alert['topic']} "
+                f"(集中度: {alert.get('concentration', '')})"
+            )
+
+        lines.append(f"\n**证据**: {alert['evidence']}")
+        lines.append(f"\n**解读**: {alert['interpretation']}")
+        lines.append("")
+
+    lines.append(
+        "> 以上报警由程序规则引擎自动触发，非 LLM 分析结果。"
+        "请 LLM 在后续分析中重点回应这些信号，但不必逐条复述。\n"
+    )
+
+    return "\n".join(lines)
+
+
+# ============================================================
 # 第5步: 构建 Prompt 并调用 DeepSeek
 # ============================================================
 
 def build_prompt(sector_data, top_repos, rising_repos,
-                 finance_news, tech_news, analysis_section=""):
+                 finance_news, tech_news, analysis_section="",
+                 alerts_section=""):
     """构建给 DeepSeek 的分析 prompt"""
     prompt = (
         "你是一个顶尖的趋势分析师。你的任务不是推荐股票，而是从"
@@ -875,6 +1150,9 @@ def build_prompt(sector_data, top_repos, rising_repos,
     prompt += "\n## 科技公司动态\n\n"
     for n in tech_news:
         prompt += f"- [{n['公司']}] {n['标题']}\n"
+
+    if alerts_section:
+        prompt += "\n" + alerts_section + "\n"
 
     if analysis_section:
         prompt += "\n" + analysis_section + "\n"
@@ -1488,10 +1766,15 @@ def main():
         corr_result, topic_result, sentiment_result
     )
 
+    # ---- 规则引擎（交叉信号异常检测）----
+    alerts_section = run_rule_engine(
+        sector_data, topic_result, sentiment_result
+    )
+
     # ---- 调用 DeepSeek ----
     prompt = build_prompt(
         sector_data, top_repos, rising_repos,
-        finance_news, tech_news, analysis_section
+        finance_news, tech_news, analysis_section, alerts_section
     )
     report_md, usage = call_deepseek(prompt)
 
