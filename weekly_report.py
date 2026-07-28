@@ -24,6 +24,11 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+import html
+import math
+import socket
+import time
+import random
 
 # ============================================================
 # 环境配置 (密钥一律从环境变量读取，绝无硬编码)
@@ -70,6 +75,12 @@ WEEK_STR = f"{NOW.year}年第{NOW.isocalendar()[1]}周"
 
 
 # ============================================================
+# 周次判断工具
+# ============================================================
+
+
+
+# ============================================================
 # 第1步: 拉取美股板块数据 (yfinance)
 # ============================================================
 
@@ -95,6 +106,7 @@ def fetch_sector_data():
     """拉取美股板块ETF本周涨跌幅"""
     logger.info("[1/4] 拉取美股板块数据...")
     import yfinance as yf
+    socket.setdefaulttimeout(30)
 
     results = []
     for name, ticker in SECTOR_ETFS.items():
@@ -238,7 +250,9 @@ def fetch_finance_news():
     all_news = []
     for source_name, url in FINANCE_RSS_FEEDS:
         try:
-            feed = feedparser.parse(url)
+            import requests as _rss_req
+            _rss_resp = _rss_req.get(url, timeout=15)
+            feed = feedparser.parse(_rss_resp.content)
             if not feed.entries:
                 logger.warning(f"  {source_name}: 无内容")
                 continue
@@ -294,12 +308,14 @@ def fetch_tech_news():
     all_news = []
     for company in TECH_COMPANIES:
         try:
-            url = (
+            import requests as _rss_req
+            _rss_resp = _rss_req.get(
                 "https://news.google.com/rss/search"
                 f"?q={company}+technology+OR+AI+OR+product+OR+acquisition"
-                "&hl=en-US&gl=US&ceid=US:en"
+                "&hl=en-US&gl=US&ceid=US:en",
+                timeout=15,
             )
-            feed = feedparser.parse(url)
+            feed = feedparser.parse(_rss_resp.content)
             if not feed.entries:
                 logger.warning(f"  {company}: 无结果")
                 continue
@@ -341,127 +357,148 @@ DB_PATH = OUTPUT_DIR / "weekly_data.db"
 
 def init_db():
     """初始化 SQLite 数据库，创建所有表"""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        cursor = conn.cursor()
 
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS sector_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_date TEXT NOT NULL,
-            week_str TEXT NOT NULL,
-            sector_name TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            change_pct TEXT,
-            open_price TEXT,
-            close_price TEXT
-        );
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS sector_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_date TEXT NOT NULL,
+                week_str TEXT NOT NULL,
+                sector_name TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                change_pct REAL,
+                open_price REAL,
+                close_price REAL,
+                UNIQUE(run_date, sector_name)
+            );
 
-        CREATE TABLE IF NOT EXISTS github_trending (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_date TEXT NOT NULL,
-            week_str TEXT NOT NULL,
-            category TEXT NOT NULL,
-            repo_name TEXT NOT NULL,
-            description TEXT,
-            language TEXT,
-            stars INTEGER,
-            topics TEXT,
-            url TEXT
-        );
+            CREATE TABLE IF NOT EXISTS github_trending (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_date TEXT NOT NULL,
+                week_str TEXT NOT NULL,
+                category TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                description TEXT,
+                language TEXT,
+                stars INTEGER,
+                topics TEXT,
+                url TEXT,
+                UNIQUE(run_date, category, repo_name)
+            );
 
-        CREATE TABLE IF NOT EXISTS finance_news (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_date TEXT NOT NULL,
-            week_str TEXT NOT NULL,
-            source TEXT,
-            title TEXT,
-            summary TEXT,
-            link TEXT
-        );
+            CREATE TABLE IF NOT EXISTS finance_news (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_date TEXT NOT NULL,
+                week_str TEXT NOT NULL,
+                source TEXT,
+                title TEXT,
+                summary TEXT,
+                link TEXT,
+                UNIQUE(run_date, title)
+            );
 
-        CREATE TABLE IF NOT EXISTS tech_news (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_date TEXT NOT NULL,
-            week_str TEXT NOT NULL,
-            company TEXT,
-            title TEXT,
-            summary TEXT,
-            link TEXT
-        );
+            CREATE TABLE IF NOT EXISTS tech_news (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_date TEXT NOT NULL,
+                week_str TEXT NOT NULL,
+                company TEXT,
+                title TEXT,
+                summary TEXT,
+                link TEXT,
+                UNIQUE(run_date, company, title)
+            );
 
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_date TEXT NOT NULL,
-            week_str TEXT NOT NULL,
-            report_md TEXT,
-            total_tokens INTEGER,
-            prompt_tokens INTEGER,
-            completion_tokens INTEGER
-        );
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_date TEXT NOT NULL,
+                week_str TEXT NOT NULL,
+                report_md TEXT,
+                total_tokens INTEGER,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER
+            );
 
-        CREATE TABLE IF NOT EXISTS daily_prices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker TEXT NOT NULL,
-            sector_name TEXT NOT NULL,
-            date TEXT NOT NULL,
-            close_price REAL NOT NULL,
-            UNIQUE(ticker, date)
-        );
-    """)
-    conn.commit()
-    conn.close()
+            CREATE TABLE IF NOT EXISTS daily_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                sector_name TEXT NOT NULL,
+                date TEXT NOT NULL,
+                close_price REAL NOT NULL,
+                UNIQUE(ticker, date)
+            );
+        """)
+        conn.commit()
     logger.info(f"  数据库已就绪: {DB_PATH}")
+
+
+def _parse_pct(val):
+    """将 '+2.34%' 转为 2.34 float，非数值返回 None"""
+    if val in ("获取失败", "数据不足", "", None):
+        return None
+    try:
+        return float(str(val).replace("%", "").replace("+", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_price(val):
+    """将 '$500.00' 转为 500.0 float，非数值返回 None"""
+    if val in ("获取失败", "数据不足", "", None):
+        return None
+    try:
+        return float(str(val).replace("$", ""))
+    except (ValueError, TypeError):
+        return None
 
 
 def save_sector_data(data):
     """将板块数据写入 SQLite"""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    for item in data:
-        cursor.execute(
-            "INSERT INTO sector_data "
-            "(run_date, week_str, sector_name, ticker, "
-            "change_pct, open_price, close_price) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (NOW.isoformat(), WEEK_STR,
-             item["板块"], item["代码"],
-             item.get("周涨跌幅", ""),
-             item.get("周一开盘", ""),
-             item.get("最新收盘", ""))
-        )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        cursor = conn.cursor()
+        for item in data:
+            cursor.execute(
+                "INSERT OR REPLACE INTO sector_data "
+                "(run_date, week_str, sector_name, ticker, "
+                "change_pct, open_price, close_price) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (NOW.isoformat(), WEEK_STR,
+                 item["板块"], item["代码"],
+                 _parse_pct(item.get("周涨跌幅", "")),
+                 _parse_price(item.get("周一开盘", "")),
+                 _parse_price(item.get("最新收盘", "")))
+            )
+        conn.commit()
     logger.info(f"  DB: {len(data)} 条板块数据已存储")
 
 
 def save_github_data(top_repos, rising_repos):
     """将 GitHub 数据写入 SQLite"""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    for repo in top_repos:
-        cursor.execute(
-            "INSERT INTO github_trending "
-            "(run_date, week_str, category, repo_name, "
-            "description, language, stars, topics, url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (NOW.isoformat(), WEEK_STR, "top",
-             repo["项目名"], repo.get("简介", ""),
-             repo.get("语言", ""), repo.get("本周Star", 0),
-             repo.get("话题", ""), repo.get("URL", ""))
-        )
-    for repo in rising_repos:
-        cursor.execute(
-            "INSERT INTO github_trending "
-            "(run_date, week_str, category, repo_name, "
-            "description, language, stars, topics, url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (NOW.isoformat(), WEEK_STR, "rising",
-             repo["项目名"], repo.get("简介", ""),
-             repo.get("语言", ""), repo.get("Star数", 0),
-             repo.get("话题", ""), repo.get("URL", ""))
-        )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        cursor = conn.cursor()
+        for repo in top_repos:
+            cursor.execute(
+                "INSERT OR REPLACE INTO github_trending "
+                "(run_date, week_str, category, repo_name, "
+                "description, language, stars, topics, url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (NOW.isoformat(), WEEK_STR, "top",
+                 repo["项目名"], repo.get("简介", ""),
+                 repo.get("语言", ""), repo.get("本周Star", 0),
+                 repo.get("话题", ""), repo.get("URL", ""))
+            )
+        for repo in rising_repos:
+            cursor.execute(
+                "INSERT OR REPLACE INTO github_trending "
+                "(run_date, week_str, category, repo_name, "
+                "description, language, stars, topics, url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (NOW.isoformat(), WEEK_STR, "rising",
+                 repo["项目名"], repo.get("简介", ""),
+                 repo.get("语言", ""), repo.get("Star数", 0),
+                 repo.get("话题", ""), repo.get("URL", ""))
+            )
+        conn.commit()
     logger.info(
         f"  DB: {len(top_repos)} + {len(rising_repos)} 条 GitHub 数据已存储"
     )
@@ -469,57 +506,54 @@ def save_github_data(top_repos, rising_repos):
 
 def save_finance_news(data):
     """将财经新闻写入 SQLite"""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    for item in data:
-        cursor.execute(
-            "INSERT INTO finance_news "
-            "(run_date, week_str, source, title, summary, link) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (NOW.isoformat(), WEEK_STR,
-             item["来源"], item["标题"],
-             item.get("摘要", ""), item.get("链接", ""))
-        )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        cursor = conn.cursor()
+        for item in data:
+            cursor.execute(
+                "INSERT OR REPLACE INTO finance_news "
+                "(run_date, week_str, source, title, summary, link) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (NOW.isoformat(), WEEK_STR,
+                 item["来源"], item["标题"],
+                 item.get("摘要", ""), item.get("链接", ""))
+            )
+        conn.commit()
     logger.info(f"  DB: {len(data)} 条财经新闻已存储")
 
 
 def save_tech_news(data):
     """将科技公司动态写入 SQLite"""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    for item in data:
-        cursor.execute(
-            "INSERT INTO tech_news "
-            "(run_date, week_str, company, title, summary, link) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (NOW.isoformat(), WEEK_STR,
-             item["公司"], item["标题"],
-             item.get("摘要", ""), item.get("链接", ""))
-        )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        cursor = conn.cursor()
+        for item in data:
+            cursor.execute(
+                "INSERT OR REPLACE INTO tech_news "
+                "(run_date, week_str, company, title, summary, link) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (NOW.isoformat(), WEEK_STR,
+                 item["公司"], item["标题"],
+                 item.get("摘要", ""), item.get("链接", ""))
+            )
+        conn.commit()
     logger.info(f"  DB: {len(data)} 条科技动态已存储")
 
 
 def save_report(report_md, usage):
     """将 LLM 报告写入 SQLite"""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    total = usage.total_tokens if usage else 0
-    prompt_t = usage.prompt_tokens if usage else 0
-    completion_t = usage.completion_tokens if usage else 0
-    cursor.execute(
-        "INSERT INTO reports "
-        "(run_date, week_str, report_md, "
-        "total_tokens, prompt_tokens, completion_tokens) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (NOW.isoformat(), WEEK_STR, report_md,
-         total, prompt_t, completion_t)
-    )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        cursor = conn.cursor()
+        total = usage.total_tokens if usage else 0
+        prompt_t = usage.prompt_tokens if usage else 0
+        completion_t = usage.completion_tokens if usage else 0
+        cursor.execute(
+            "INSERT INTO reports "
+            "(run_date, week_str, report_md, "
+            "total_tokens, prompt_tokens, completion_tokens) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (NOW.isoformat(), WEEK_STR, report_md,
+             total, prompt_t, completion_t)
+        )
+        conn.commit()
     logger.info(f"  DB: LLM 报告已存储 ({len(report_md)} 字符)")
 
 
@@ -531,6 +565,7 @@ def fetch_daily_prices():
     """拉取近 4 周每日收盘价，用于相关性分析"""
     logger.info("[分析] 拉取近 4 周每日价格...")
     import yfinance as yf
+    socket.setdefaulttimeout(30)
 
     four_weeks_ago = NOW - timedelta(days=28)
     prices = {}
@@ -551,24 +586,23 @@ def fetch_daily_prices():
             logger.warning(f"    {ticker} 拉取失败: {e}")
 
     # 存入 SQLite
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    saved = 0
-    for ticker, info in prices.items():
-        for dt, price in info["close"].items():
-            try:
-                cursor.execute(
-                    "INSERT OR IGNORE INTO daily_prices "
-                    "(ticker, sector_name, date, close_price) "
-                    "VALUES (?, ?, ?, ?)",
-                    (ticker, info["name"],
-                     dt.strftime("%Y-%m-%d"), float(price))
-                )
-                saved += 1
-            except Exception:
-                pass
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        cursor = conn.cursor()
+        saved = 0
+        for ticker, info in prices.items():
+            for dt, price in info["close"].items():
+                try:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO daily_prices "
+                        "(ticker, sector_name, date, close_price) "
+                        "VALUES (?, ?, ?, ?)",
+                        (ticker, info["name"],
+                         dt.strftime("%Y-%m-%d"), float(price))
+                    )
+                    saved += 1
+                except Exception:
+                    pass
+        conn.commit()
     logger.info(f"  每日价格: {len(prices)} 个 ETF, 存储 {saved} 条")
     return prices
 
@@ -577,7 +611,8 @@ def compute_sector_correlation(prices):
     """计算板块间 Pearson 相关系数（基于近 4 周每日收益率）"""
     logger.info("[分析] 计算板块相关性矩阵...")
 
-    if len(prices) < 3:
+    from functools import reduce
+    if len(prices) < RULE_CONFIG["correlation_min_sectors"]:
         logger.warning("  板块数据不足，跳过相关性分析")
         return None
 
@@ -593,24 +628,31 @@ def compute_sector_correlation(prices):
         dfs[ticker] = info["close"]
 
     df = pd.DataFrame(dfs)
+    # 丢弃全 NaN 列
+    df = df.dropna(axis=1, how="all")
     returns = df.pct_change().dropna()
 
-    if len(returns) < 5:
+    if len(returns) < RULE_CONFIG["correlation_min_days"]:
         logger.warning(f"  有效交易日不足 ({len(returns)} 天)")
         return None
 
     # 相关性矩阵
     corr = returns.corr()
 
+    # 过滤 NaN 列/行
+    corr = corr.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
     # ticker → 中文名称映射
     ticker_to_name = {v: k for k, v in SECTOR_ETFS.items()}
 
-    # 提取所有配对
+    # 提取所有配对，跳过含 NaN 的对
     pairs = []
     tickers = list(corr.columns)
     for i, t1 in enumerate(tickers):
         for t2 in tickers[i + 1:]:
             r = corr.loc[t1, t2]
+            if r is None or (isinstance(r, float) and math.isnan(r)):
+                continue
             pairs.append((t1, t2, r))
 
     pairs.sort(key=lambda x: x[2], reverse=True)
@@ -823,6 +865,12 @@ def build_analysis_section(corr_result, topic_result, sentiment_result):
 
 
 # ============================================================
+# 月度数据聚合 — 从 SQLite 近4周数据计算月度趋势指标
+# ============================================================
+
+
+
+# ============================================================
 # 规则引擎 — 多信号交叉异常检测，直接标红报警
 # ============================================================
 
@@ -856,6 +904,24 @@ SECTOR_TOPIC_MAP = {
 }
 
 
+# ============================================================
+# 规则引擎 — 配置化阈值
+# ============================================================
+
+RULE_CONFIG = {
+    "divergence_top_n": 3,
+    "sentiment_positive_threshold": 0.3,
+    "sentiment_negative_threshold": -0.2,
+    "sentiment_up_ratio_low": 0.35,
+    "sentiment_up_ratio_high": 0.65,
+    "topic_concentration_threshold": 0.30,
+    "correlation_cluster_threshold": 0.7,
+    "correlation_min_sectors": 3,
+    "correlation_min_days": 5,
+    "rule_engine_min_sectors": 5,
+}
+
+
 def check_capital_code_divergence(sector_data, topic_result):
     """规则1：资本-代码背离。板块涨但GitHub无声 / GitHub热但板块跌"""
     if not topic_result or not topic_result.get("top_topics"):
@@ -875,13 +941,14 @@ def check_capital_code_divergence(sector_data, topic_result):
         key=lambda x: float(x["周涨跌幅"].replace("%", "").replace("+", "")),
         reverse=True,
     )
-    if len(ranked) < 5:
+    if len(ranked) < RULE_CONFIG["rule_engine_min_sectors"]:
         return None
 
     alerts = []
 
-    # 涨幅 Top 3，对应 GitHub 话题完全缺席
-    for sector in ranked[:3]:
+    top_n = RULE_CONFIG["divergence_top_n"]
+    # 涨幅 Top N，对应 GitHub 话题完全缺席
+    for sector in ranked[:top_n]:
         name = sector["板块"]
         topics = SECTOR_TOPIC_MAP.get(name, set())
         if not topics:
@@ -967,7 +1034,7 @@ def check_sentiment_price_divergence(sector_data, sentiment_result):
     up_ratio = up_count / total
     alerts = []
 
-    if avg_sentiment > 0.3 and up_ratio < 0.35:
+    if avg_sentiment > RULE_CONFIG["sentiment_positive_threshold"] and up_ratio < RULE_CONFIG["sentiment_up_ratio_low"]:
         alerts.append({
             "type": "情绪-价格背离",
             "direction": "媒体乐观、市场悲观",
@@ -983,7 +1050,7 @@ def check_sentiment_price_divergence(sector_data, sentiment_result):
             ),
         })
 
-    if avg_sentiment < -0.2 and up_ratio > 0.65:
+    if avg_sentiment < RULE_CONFIG["sentiment_negative_threshold"] and up_ratio > RULE_CONFIG["sentiment_up_ratio_high"]:
         alerts.append({
             "type": "情绪-价格背离",
             "direction": "媒体悲观、市场乐观",
@@ -1018,7 +1085,7 @@ def check_topic_concentration(topic_result):
     top_topic, top_count = topics[0]
     concentration = top_count / total_mentions
 
-    if concentration > 0.30:
+    if concentration > RULE_CONFIG["topic_concentration_threshold"]:
         logger.info(
             f"  [规则引擎] 话题集中度: {top_topic} 占 {concentration:.0%}"
         )
@@ -1074,24 +1141,15 @@ def run_rule_engine(sector_data, topic_result, sentiment_result):
         if "direction" in alert:
             lines.append(f"**方向**: {alert['direction']}")
         if "sector" in alert:
-            lines.append(
-                f"**涉及板块**: {alert['sector']} "
-                f"({alert.get('change', '')})"
-            )
+            lines.append(f"**涉及板块**: {alert['sector']} ({alert.get('change', '')})")
         if "topic" in alert:
-            lines.append(
-                f"**相关话题**: {alert['topic']} "
-                f"(集中度: {alert.get('concentration', '')})"
-            )
+            lines.append(f"**相关话题**: {alert['topic']} (集中度: {alert.get('concentration', '')})")
 
         lines.append(f"\n**证据**: {alert['evidence']}")
         lines.append(f"\n**解读**: {alert['interpretation']}")
         lines.append("")
 
-    lines.append(
-        "> 以上报警由程序规则引擎自动触发，非 LLM 分析结果。"
-        "请 LLM 在后续分析中重点回应这些信号，但不必逐条复述。\n"
-    )
+    lines.append( "> 以上报警由程序规则引擎自动触发，非 LLM 分析结果。" "请 LLM 在后续分析中重点回应这些信号，但不必逐条复述。\n" )
 
     return "\n".join(lines)
 
@@ -1099,6 +1157,21 @@ def run_rule_engine(sector_data, topic_result, sentiment_result):
 # ============================================================
 # 第5步: 构建 Prompt 并调用 DeepSeek
 # ============================================================
+
+def _truncate_prompt(text: str, max_chars: int) -> str:
+    """粗略 token 估算 (中英文混合按 ~4 chars/token)，超限截断"""
+    max_tokens = max_chars // 4
+    estimated_tokens = len(text) / 4
+    if estimated_tokens <= max_tokens:
+        return text
+    ratio = max_tokens / estimated_tokens
+    keep_len = int(len(text) * ratio * 0.95)
+    logger.warning(
+        f"  Prompt 估算 {estimated_tokens:.0f} tokens，"
+        f"截断至 ~{max_tokens} tokens ({keep_len} 字符)"
+    )
+    return text[:keep_len] + "\n\n[注: 输入过长已截断]"
+
 
 def build_prompt(sector_data, top_repos, rising_repos,
                  finance_news, tech_news, analysis_section="",
@@ -1220,11 +1293,11 @@ def build_prompt(sector_data, top_repos, rising_repos,
 6. 输出纯 Markdown，不要用代码块包裹
 7. 隐性关联分析是你最有价值的产出，认真写
 """
-    return prompt
+    return _truncate_prompt(prompt, 60000 * 4)
 
 
 def call_deepseek(prompt: str):
-    """调用 DeepSeek API 生成报告"""
+    """调用 DeepSeek API 生成报告（含重试 + finish_reason 检查）"""
     logger.info("调用 DeepSeek API...")
 
     if not DEEPSEEK_API_KEY:
@@ -1234,50 +1307,86 @@ def call_deepseek(prompt: str):
         )
         return None, None
 
-    try:
-        from openai import OpenAI
+    max_retries = 3
+    last_error = None
 
-        client = OpenAI(
-            api_key=DEEPSEEK_API_KEY,
-            base_url=DEEPSEEK_BASE_URL,
-        )
+    for attempt in range(1, max_retries + 1):
+        try:
+            from openai import OpenAI
 
-        logger.info(
-            f"  模型: {DEEPSEEK_MODEL}, "
-            f"prompt 约 {len(prompt)} 字符"
-        )
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一个顶尖的趋势分析师，擅长从资本流向、"
-                        "开发者社区、科技巨头动作和财经新闻四个维度"
-                        "交叉比对，找出未来趋势。你的风格: 简洁、"
-                        "有数据支撑、敢于下判断但标注不确定性。"
-                        "你坚信代码不会说谎，资本比媒体快半步。"
-                        "用中文输出。"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-            max_tokens=8192,
-        )
+            client = OpenAI(
+                api_key=DEEPSEEK_API_KEY,
+                base_url=DEEPSEEK_BASE_URL,
+                timeout=60,
+            )
 
-        report = response.choices[0].message.content
-        usage = response.usage
-        logger.info(
-            f"  报告完成: {len(report)} 字符, "
-            f"{usage.total_tokens} tokens "
-            f"(in={usage.prompt_tokens}, out={usage.completion_tokens})"
-        )
-        return report, usage
+            logger.info(
+                f"  模型: {DEEPSEEK_MODEL}, "
+                f"prompt 约 {len(prompt)} 字符"
+                f"{'' if attempt == 1 else f' (第{attempt}次重试)'}"
+            )
+            response = client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是一个顶尖的趋势分析师，擅长从资本流向、"
+                            "开发者社区、科技巨头动作和财经新闻四个维度"
+                            "交叉比对，找出未来趋势。你的风格: 简洁、"
+                            "有数据支撑、敢于下判断但标注不确定性。"
+                            "你坚信代码不会说谎，资本比媒体快半步。"
+                            "用中文输出。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.7,
+                max_tokens=8192,
+            )
 
-    except Exception as e:
-        logger.error(f"  DeepSeek API 失败: {e}")
-        return None, None
+            # ---- finish_reason 检查 ----
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason in ("length", "content_filter", "stop"):
+                report = response.choices[0].message.content
+                usage = response.usage
+                if finish_reason == "length":
+                    logger.warning(
+                        "  LLM 输出被截断 (finish_reason=length)，"
+                        "报告可能不完整"
+                    )
+                elif finish_reason == "content_filter":
+                    logger.warning(
+                        "  LLM 输出被内容过滤器截断 "
+                        "(finish_reason=content_filter)"
+                    )
+                logger.info(
+                    f"  报告完成: {len(report)} 字符, "
+                    f"{usage.total_tokens} tokens "
+                    f"(in={usage.prompt_tokens}, "
+                    f"out={usage.completion_tokens})"
+                )
+                return report, usage
+
+            logger.warning(
+                f"  意外的 finish_reason: {finish_reason}，"
+                "视同失败"
+            )
+            last_error = f"unexpected finish_reason: {finish_reason}"
+            continue
+
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"  DeepSeek API 失败 (第{attempt}次): {e}"
+            )
+            if attempt < max_retries:
+                sleep_time = 2 ** attempt + random.uniform(0, 1)
+                logger.info(f"  {sleep_time:.1f}s 后重试...")
+                time.sleep(sleep_time)
+
+    logger.error(f"  DeepSeek API 全部 {max_retries} 次尝试失败: {last_error}")
+    return None, None
 
 
 # ============================================================
@@ -1527,8 +1636,9 @@ def md_to_html(md_text: str) -> str:
                     'margin:8px 0; padding:4px 12px; color:#555">'
                 )
                 in_blockquote = True
+            content = html.escape(stripped[2:])
             content = re.sub(
-                r"\*\*(.+?)\*\*", r"<b>\1</b>", stripped[2:]
+                r"\*\*(.+?)\*\*", r"<b>\1</b>", content
             )
             html_parts.append(f"<p>{content}</p>")
             continue
@@ -1543,7 +1653,7 @@ def md_to_html(md_text: str) -> str:
                 html_parts.append("</ul>")
                 in_ul = False
             html_parts.append(
-                f"<h4 style='color:#444'>{stripped[5:]}</h4>"
+                f"<h4 style='color:#444'>{html.escape(stripped[5:])}</h4>"
             )
         elif stripped.startswith("### "):
             if in_ul:
@@ -1551,7 +1661,7 @@ def md_to_html(md_text: str) -> str:
                 in_ul = False
             html_parts.append(
                 f"<h3 style='color:#333; margin-top:20px'>"
-                f"{stripped[4:]}</h3>"
+                f"{html.escape(stripped[4:])}</h3>"
             )
         elif stripped.startswith("## "):
             if in_ul:
@@ -1560,7 +1670,7 @@ def md_to_html(md_text: str) -> str:
             html_parts.append(
                 f"<h2 style='color:#222; margin-top:24px; "
                 f"border-bottom:1px solid #ddd; padding-bottom:4px'>"
-                f"{stripped[3:]}</h2>"
+                f"{html.escape(stripped[3:])}</h2>"
             )
         elif stripped.startswith("# "):
             if in_ul:
@@ -1568,7 +1678,7 @@ def md_to_html(md_text: str) -> str:
                 in_ul = False
             html_parts.append(
                 f"<h1 style='color:#111; margin-top:28px'>"
-                f"{stripped[2:]}</h1>"
+                f"{html.escape(stripped[2:])}</h1>"
             )
         elif stripped == "---":
             if in_ul:
@@ -1587,8 +1697,9 @@ def md_to_html(md_text: str) -> str:
                     '<ul style="padding-left:20px">'
                 )
                 in_ul = True
+            content = html.escape(stripped[2:])
             content = re.sub(
-                r"\*\*(.+?)\*\*", r"<b>\1</b>", stripped[2:]
+                r"\*\*(.+?)\*\*", r"<b>\1</b>", content
             )
             html_parts.append(f"<li>{content}</li>")
         elif re.match(r"^\d+\.\s", stripped):
@@ -1600,8 +1711,9 @@ def md_to_html(md_text: str) -> str:
                     '<ol style="padding-left:20px">'
                 )
                 in_ol = True
+            content = html.escape(stripped)
             content = re.sub(
-                r"\*\*(.+?)\*\*", r"<b>\1</b>", stripped
+                r"\*\*(.+?)\*\*", r"<b>\1</b>", content
             )
             html_parts.append(f"<li>{content}</li>")
         else:
@@ -1611,8 +1723,9 @@ def md_to_html(md_text: str) -> str:
             if in_ol:
                 html_parts.append("</ol>")
                 in_ol = False
+            content = html.escape(stripped)
             content = re.sub(
-                r"\*\*(.+?)\*\*", r"<b>\1</b>", stripped
+                r"\*\*(.+?)\*\*", r"<b>\1</b>", content
             )
             content = re.sub(r"\*(.+?)\*", r"<i>\1</i>", content)
             content = re.sub(
@@ -1665,9 +1778,11 @@ def md_to_html(md_text: str) -> str:
 # 第8步: 发送邮件
 # ============================================================
 
-def send_email(pdf_path: Optional[Path], report_md: str) -> bool:
+def send_email(pdf_path: Optional[Path], report_md: str,
+               subject_suffix: str = "") -> bool:
     """通过 QQ 邮箱发送报告 (HTML 正文 + PDF 附件)"""
-    logger.info("发送邮件...")
+    suffix_log = f" {subject_suffix}" if subject_suffix else ""
+    logger.info(f"发送邮件...{suffix_log}")
 
     if not QQ_EMAIL or not QQ_SMTP_CODE:
         logger.error("QQ_EMAIL 或 QQ_SMTP_CODE 未设置!")
@@ -1682,9 +1797,12 @@ def send_email(pdf_path: Optional[Path], report_md: str) -> bool:
     msg = MIMEMultipart("mixed")
     msg["From"] = QQ_EMAIL
     msg["To"] = RECIPIENT_EMAIL
-    msg["Subject"] = (
+    subject = (
         f"[每周趋势雷达] {WEEK_STR} ({NOW.strftime('%m/%d')})"
     )
+    if subject_suffix:
+        subject += f" {subject_suffix}"
+    msg["Subject"] = subject
 
     # HTML 正文
     html_body = md_to_html(report_md)
@@ -1708,7 +1826,7 @@ def send_email(pdf_path: Optional[Path], report_md: str) -> bool:
 
     try:
         with smtplib.SMTP_SSL(
-            QQ_SMTP_SERVER, QQ_SMTP_PORT
+            QQ_SMTP_SERVER, QQ_SMTP_PORT, timeout=30
         ) as server:
             server.login(QQ_EMAIL, QQ_SMTP_CODE)
             server.send_message(msg)
@@ -1717,6 +1835,240 @@ def send_email(pdf_path: Optional[Path], report_md: str) -> bool:
     except Exception as e:
         logger.error(f"  邮件发送失败: {e}")
         return False
+
+
+# ============================================================
+# 月度报告模块
+# ============================================================
+
+
+def is_month_end(week_str: str) -> bool:
+    """判断当前 ISO 周是否跨越月末（下周一进入下个月即为月末）"""
+    today = NOW
+    # ISO 周一是一周的开始
+    next_monday = today + timedelta(days=(7 - today.weekday()))
+    is_end = next_monday.month != today.month
+    if is_end:
+        logger.info(f"[月度] 检测到月末周: {week_str}，下周一进入{next_monday.month}月")
+    return is_end
+
+
+def load_recent_reports(db_path: Path, limit: int = 4) -> list:
+    """从数据库加载最近 N 周的完整报告 Markdown"""
+    logger.info(f"[月度] 从数据库加载最近 {limit} 周报告...")
+    with sqlite3.connect(str(db_path)) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT report_md FROM reports ORDER BY run_date DESC LIMIT ?",
+            (limit,)
+        )
+        rows = cursor.fetchall()
+    reports = [row[0] for row in rows if row[0]]
+    logger.info(f"  加载了 {len(reports)} 份周报")
+    return reports
+
+
+def aggregate_monthly_data(db_path: Path) -> dict:
+    """从数据库聚合本月所有数据，返回结构化摘要"""
+    logger.info("[月度] 聚合本月数据...")
+    month_str = NOW.strftime("%Y%m")
+    month_start = NOW.replace(day=1).strftime("%Y-%m-%d")
+
+    # 计算月末最后一天（下月1日减1天）
+    if NOW.month == 12:
+        month_end = NOW.replace(year=NOW.year + 1, month=1, day=1)
+    else:
+        month_end = NOW.replace(month=NOW.month + 1, day=1)
+    month_end_str = (month_end - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        cursor = conn.cursor()
+
+        # 板块月均涨跌
+        cursor.execute("""
+            SELECT sector_name, ticker,
+                   ROUND(AVG(change_pct), 2) as avg_change,
+                   COUNT(*) as weeks
+            FROM sector_data
+            WHERE run_date >= ? AND run_date < ?
+              AND change_pct IS NOT NULL
+            GROUP BY sector_name, ticker
+            ORDER BY avg_change DESC
+        """, (month_start, month_end_str))
+        sector_rows = cursor.fetchall()
+
+        # GitHub 热门项目计数
+        cursor.execute("""
+            SELECT COUNT(*) FROM github_trending
+            WHERE run_date >= ? AND run_date < ?
+        """, (month_start, month_end_str))
+        github_count = cursor.fetchone()[0]
+
+        # GitHub 话题汇总
+        cursor.execute("""
+            SELECT topics FROM github_trending
+            WHERE run_date >= ? AND run_date < ?
+              AND topics IS NOT NULL AND topics != ''
+        """, (month_start, month_end_str))
+        all_topics = []
+        for row in cursor.fetchall():
+            all_topics.extend(row[0].split(", "))
+
+        # 财经新闻计数
+        cursor.execute("""
+            SELECT COUNT(*) FROM finance_news
+            WHERE run_date >= ? AND run_date < ?
+        """, (month_start, month_end_str))
+        news_count = cursor.fetchone()[0]
+
+        # 科技动态计数
+        cursor.execute("""
+            SELECT COUNT(*) FROM tech_news
+            WHERE run_date >= ? AND run_date < ?
+        """, (month_start, month_end_str))
+        tech_count = cursor.fetchone()[0]
+
+        # 报告周列表
+        cursor.execute("""
+            SELECT DISTINCT week_str FROM reports
+            WHERE run_date >= ? AND run_date < ?
+            ORDER BY run_date
+        """, (month_start, month_end_str))
+        report_weeks = [row[0] for row in cursor.fetchall()]
+
+    # 热门话题 Top 10
+    from collections import Counter
+    topic_counter = Counter(t for t in all_topics if t.strip())
+    top_topics = topic_counter.most_common(10) if topic_counter else []
+
+    result = {
+        "month_str": month_str,
+        "month_label": f"{NOW.year}年{NOW.month}月",
+        "sector_avg": sector_rows,
+        "github_count": github_count,
+        "news_count": news_count,
+        "tech_count": tech_count,
+        "report_weeks": report_weeks,
+        "top_topics": top_topics,
+        "data_start": month_start,
+        "data_end": month_end_str,
+    }
+    logger.info(
+        f"  月度聚合完成: {len(sector_rows)} 板块, "
+        f"{github_count} GitHub, {news_count} 新闻, "
+        f"{tech_count} 科技动态, {len(report_weeks)} 周"
+    )
+    return result
+
+
+def build_monthly_prompt(monthly_data: dict, weekly_reports: list) -> str:
+    """构建月度 LLM 分析提示词"""
+    prompt_lines = []
+    prompt_lines.append("你是一个宏观趋势分析师。以下是过去4周的市场周报数据，请做月度综述。\n")
+    prompt_lines.append("要求：\n")
+    prompt_lines.append("1. 跨周对比板块涨跌趋势，识别持续上行/下行的板块\n")
+    prompt_lines.append("2. 识别本月 GitHub 持续热门的主题，判断技术热点方向\n")
+    prompt_lines.append("3. 对比每周之间的信号变化（资本流向、开发者关注迁移）\n")
+    prompt_lines.append("4. 输出月度级别的关键信号和风险提示\n")
+    prompt_lines.append("5. 用 Markdown 格式输出，结构清晰\n")
+
+    if monthly_data.get("sector_avg"):
+        prompt_lines.append("\n## 板块月度表现\n")
+        for row in monthly_data["sector_avg"]:
+            name, ticker, avg_chg, weeks = row
+            chg_str = f"{avg_chg:+.2f}%" if avg_chg is not None else "N/A"
+            prompt_lines.append(f"- {name} ({ticker}): 月均 {chg_str}，计入 {weeks} 周\n")
+
+    if monthly_data.get("top_topics"):
+        prompt_lines.append("\n## GitHub 月度热门话题\n")
+        for topic, count in monthly_data["top_topics"]:
+            prompt_lines.append(f"- {topic}: 出现 {count} 次\n")
+
+    if weekly_reports:
+        prompt_lines.append("\n## 近4周周报原文摘要\n")
+        for i, report in enumerate(weekly_reports, 1):
+            snippet = report[:2000] if len(report) > 2000 else report
+            prompt_lines.append(f"### 第{i}周\n{snippet}\n---\n")
+
+    prompt = "\n".join(prompt_lines)
+    prompt = _truncate_prompt(prompt, 60000 * 4)
+    logger.info(f"  月度 prompt: {len(prompt)} 字符 (~{len(prompt)//4} tokens)")
+    return prompt
+
+
+def generate_monthly_report(monthly_data: dict, weekly_reports: list) -> str:
+    """生成月度综述：优先 LLM 分析，失败时降级为本地规则"""
+    logger.info("[月度] 生成月度综述...")
+
+    try:
+        prompt = build_monthly_prompt(monthly_data, weekly_reports)
+        logger.info("[月度] 调用 DeepSeek LLM...")
+        report_md, usage = call_deepseek(prompt)
+        if report_md and len(report_md.strip()) > 200:
+            logger.info(f"[月度] LLM 分析完成: {len(report_md)} 字符")
+            return report_md
+        logger.warning("[月度] LLM 返回内容过短，降级为本地规则")
+    except Exception as e:
+        logger.warning(f"[月度] LLM 调用失败 ({e})，降级为本地规则")
+
+    logger.info("[月度] 使用本地规则生成月度综述...")
+    lines = []
+    lines.append(f"# 月度趋势雷达 - {monthly_data['month_label']}\n")
+    lines.append(f"> **数据范围**: {monthly_data['data_start']} 至 {monthly_data['data_end']}\n")
+    lines.append(f"> *LLM 不可用，以下为结构化数据汇总*\n")
+    lines.append("---\n")
+
+    if monthly_data.get("sector_avg"):
+        lines.append("## 板块月度表现\n")
+        lines.append("| 板块 | 代码 | 月均涨跌幅 | 计入周数 |")
+        lines.append("|------|------|-----------|---------|")
+        for row in monthly_data["sector_avg"]:
+            name, ticker, avg_chg, weeks = row
+            chg_str = f"{avg_chg:+.2f}%" if avg_chg is not None else "N/A"
+            lines.append(f"| {name} | {ticker} | {chg_str} | {weeks} |")
+
+    if monthly_data.get("top_topics"):
+        lines.append("\n## GitHub 月度热门话题\n")
+        for topic, count in monthly_data["top_topics"]:
+            lines.append(f"- {topic}: {count} 次")
+
+    lines.append(f"\n---\n*本月度报告自动汇总 {len(weekly_reports)} 份周报，仅供参考*")
+    result = "\n".join(lines)
+    logger.info(f"  月度综述(本地): {len(result)} 字符")
+    return result
+
+def save_monthly_report(report_md: str, month_str: str, output_dir: Path) -> tuple:
+    """保存月度报告 Markdown 并生成 PDF，返回 (md_path, pdf_path)"""
+    logger.info(f"[PROGRESS] 保存月度报告: {month_str}")
+
+    # ---- Markdown ----
+    md_filename = f"monthly_{month_str}.md"
+    md_path = output_dir / md_filename
+    md_path.write_text(report_md, encoding="utf-8")
+    logger.info(f"  [PROGRESS] Markdown -> {md_path}")
+
+    # ---- PDF ----
+    pdf_path = None
+    font_path = find_cjk_font()
+    if font_path:
+        try:
+            # markdown_to_pdf 会输出 WeeklyTrendRadar_*.pdf，生成后重命名
+            tmp_pdf = markdown_to_pdf(report_md, font_path)
+            target_pdf = output_dir / f"monthly_{month_str}.pdf"
+            if tmp_pdf and tmp_pdf.exists():
+                # 如目标已存在则先移除
+                if target_pdf.exists():
+                    target_pdf.unlink()
+                import shutil
+                shutil.move(str(tmp_pdf), str(target_pdf))
+                pdf_path = target_pdf
+                logger.info(f"  [PROGRESS] PDF -> {pdf_path}")
+        except Exception as e:
+            logger.error(f"  [月度] PDF 生成失败: {e}")
+    else:
+        logger.warning("  [月度] 未找到中文字体，跳过 PDF 生成")
+
+    return md_path, pdf_path if pdf_path else None
 
 
 # ============================================================
@@ -1730,81 +2082,122 @@ def main():
     )
     logger.info("=" * 60)
 
-    # ---- 初始化数据库 ----
-    init_db()
-
-    # ---- 拉取数据 ----
-    sector_data = fetch_sector_data()
-    save_sector_data(sector_data)
-
-    top_repos, rising_repos = fetch_github_trending()
-    save_github_data(top_repos, rising_repos)
-
-    finance_news = fetch_finance_news()
-    save_finance_news(finance_news)
-
-    tech_news = fetch_tech_news()
-    save_tech_news(tech_news)
-
-    # ---- 检查关键数据 ----
-    sector_ok = any(
-        s.get("周涨跌幅") not in ("获取失败", "数据不足")
-        for s in sector_data
-    )
-    if not sector_ok:
-        logger.error("板块数据全部失败，但仍尝试生成报告")
-
-    if not top_repos and not rising_repos:
-        logger.warning("GitHub 数据为空 (可能被限流)")
-
-    # ---- 数据透视（程序自行计算，非 LLM 生成）----
-    daily_prices = fetch_daily_prices()
-    corr_result = compute_sector_correlation(daily_prices)
-    topic_result = compute_github_topic_clusters(top_repos, rising_repos)
-    sentiment_result = compute_news_sentiment(finance_news)
-    analysis_section = build_analysis_section(
-        corr_result, topic_result, sentiment_result
-    )
-
-    # ---- 规则引擎（交叉信号异常检测）----
-    alerts_section = run_rule_engine(
-        sector_data, topic_result, sentiment_result
-    )
-
-    # ---- 调用 DeepSeek ----
-    prompt = build_prompt(
-        sector_data, top_repos, rising_repos,
-        finance_news, tech_news, analysis_section, alerts_section
-    )
-    report_md, usage = call_deepseek(prompt)
-
-    if not report_md:
-        logger.error("DeepSeek 报告生成失败，流程终止")
+    # ---- 密钥预检（早失败，避免跑完全程才炸）----
+    _REQUIRED_KEYS = {
+        "DEEPSEEK_API_KEY": DEEPSEEK_API_KEY,
+        "QQ_EMAIL": QQ_EMAIL,
+        "QQ_SMTP_CODE": QQ_SMTP_CODE,
+    }
+    missing = [k for k, v in _REQUIRED_KEYS.items() if not v]
+    if missing:
+        logger.error(
+            f"缺少必要密钥/配置: {', '.join(missing)}。"
+            "请检查环境变量或 .env 文件。"
+        )
         sys.exit(1)
 
-    # ---- 存入数据库 ----
-    save_report(report_md, usage)
+    report_md = None
+    usage = None
+    pdf_path = None
 
-    # ---- 保存 Markdown ----
-    md_path = OUTPUT_DIR / f"report_{NOW.strftime('%Y%m%d')}.md"
-    md_path.write_text(report_md, encoding="utf-8")
-    logger.info(f"Markdown 已保存: {md_path}")
+    try:
 
-    # ---- 生成 PDF ----
-    pdf_path = generate_pdf(report_md)
+        # ---- 初始化数据库 ----
+        init_db()
 
-    # ---- 发送邮件 ----
-    success = send_email(pdf_path, report_md)
+        # ---- 拉取数据 ----
+        sector_data = fetch_sector_data()
+        save_sector_data(sector_data)
 
-    # ---- 收尾 ----
-    logger.info("=" * 60)
-    if success:
-        logger.info(f"Done! Report sent to {RECIPIENT_EMAIL}")
-    else:
-        logger.warning(
-            f"Report generated but email failed. See: {md_path}"
+        top_repos, rising_repos = fetch_github_trending()
+        save_github_data(top_repos, rising_repos)
+
+        finance_news = fetch_finance_news()
+        save_finance_news(finance_news)
+
+        tech_news = fetch_tech_news()
+        save_tech_news(tech_news)
+
+        # ---- 检查关键数据 ----
+        sector_ok = any(
+            s.get("周涨跌幅") not in ("获取失败", "数据不足")
+            for s in sector_data
         )
-    logger.info("=" * 60)
+        if not sector_ok:
+            logger.error("板块数据全部失败，但仍尝试生成报告")
+
+        if not top_repos and not rising_repos:
+            logger.warning("GitHub 数据为空 (可能被限流)")
+
+        # ---- 数据透视（程序自行计算，非 LLM 生成）----
+        daily_prices = fetch_daily_prices()
+        corr_result = compute_sector_correlation(daily_prices)
+        topic_result = compute_github_topic_clusters(top_repos, rising_repos)
+        sentiment_result = compute_news_sentiment(finance_news)
+        analysis_section = build_analysis_section(
+            corr_result, topic_result, sentiment_result
+        )
+
+        # ---- 规则引擎（交叉信号异常检测）----
+        alerts_section = run_rule_engine(
+            sector_data, topic_result, sentiment_result
+        )
+
+        # ---- 调用 DeepSeek ----
+        prompt = build_prompt(
+            sector_data, top_repos, rising_repos,
+            finance_news, tech_news, analysis_section, alerts_section
+        )
+        report_md, usage = call_deepseek(prompt)
+
+        if not report_md:
+            logger.error("DeepSeek 报告生成失败，流程终止")
+            sys.exit(1)
+
+        # ---- 存入数据库 ----
+        save_report(report_md, usage)
+
+        # ---- 保存 Markdown ----
+        md_path = OUTPUT_DIR / f"report_{NOW.strftime('%Y%m%d')}.md"
+        md_path.write_text(report_md, encoding="utf-8")
+        logger.info(f"Markdown 已保存: {md_path}")
+
+        # ---- 生成 PDF ----
+        pdf_path = generate_pdf(report_md)
+
+        # ---- 发送邮件 ----
+        success = send_email(pdf_path, report_md)
+
+        # ---- 月度报告 ----
+        if is_month_end(WEEK_STR):
+            logger.info("[PROGRESS] 检测到月末周，开始月度报告流程...")
+            monthly_data = aggregate_monthly_data(DB_PATH)
+            weekly_reports = load_recent_reports(DB_PATH, limit=4)
+            month_str = NOW.strftime("%Y%m")
+            monthly_md = generate_monthly_report(monthly_data, weekly_reports)
+            md_path_m, pdf_path_m = save_monthly_report(
+                monthly_md, month_str, OUTPUT_DIR
+            )
+            send_email(
+                pdf_path_m, monthly_md, subject_suffix="[月度综述]"
+            )
+            logger.info(f"[PROGRESS] 月度报告完成: {month_str}")
+
+        # ---- 收尾 ----
+        logger.info("=" * 60)
+        if success:
+            logger.info(f"Done! Report sent to {RECIPIENT_EMAIL}")
+        else:
+            logger.warning(
+                f"Report generated but email failed. See: {md_path}"
+            )
+        logger.info("=" * 60)
+
+    except Exception as e:
+        logger.exception(f"主流程异常: {e}")
+        sys.exit(1)
+    finally:
+        logger.info("=== Weekly Trend Radar - End ===")
 
 
 if __name__ == "__main__":

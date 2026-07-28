@@ -15,6 +15,10 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Agent 输出
+.agent_outputs/
+resume.md
+
 # IDE
 .vscode/
 .idea/

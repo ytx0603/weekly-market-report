@@ -3,6 +3,9 @@ name: 每周趋势雷达
 on:
   schedule:
     # 北京时间每周日 20:00 = UTC 12:00
+    # 月度报告（月报）由 weekly_report.py 中的 is_month_end() 自动判断：
+    # 如果本周是本月第 4 或第 5 个周日所在的周，脚本会自行生成月度汇总。
+    # 因此不需要单独的 monthly.yml 文件，所有触发统一走此 workflow。
     - cron: "0 12 * * 0"
   workflow_dispatch:  # 允许手动触发测试
 
